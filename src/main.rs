@@ -1,5 +1,6 @@
 use gh_stats::report;
 
-fn main() {
-    report().unwrap();
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    report().await.unwrap();
 }
