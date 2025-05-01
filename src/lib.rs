@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env};
+use std::{collections::HashMap, env, fmt::Display};
 
 use itertools::Itertools;
 use reqwest::{header::{HeaderMap, HeaderValue}, Client};
@@ -25,12 +25,13 @@ fn search_url(query: &str, page: u32) -> String {
     )
 }
 
-async fn prs_from_search(client: &Client, query: &str) -> Result<Vec<PRInfo>> {
+async fn prs_from_search(client: &Client, query: impl Into<String>) -> Result<Vec<PRInfo>> {
     let mut all = Vec::new();
     let per_page = 100;
+    let query = query.into();
     // get first response, which tells how many other requests to make
     let resp: PRList = client
-        .get(search_url(query, 1))
+        .get(search_url(&query, 1))
         .send()
         .await?
         .json()
@@ -39,8 +40,10 @@ async fn prs_from_search(client: &Client, query: &str) -> Result<Vec<PRInfo>> {
 
     // issue all other page requests in parallel
     let num_pages = (resp.total_count as f32 / per_page as f32).ceil() as u32;
+    log::debug!("first page returned from query {query}, total count is: {}, num pages: {num_pages}", resp.total_count);
+
     let mut paged_res: JoinSet<_> = (2..=num_pages)
-        .map(|page| client.get(search_url(query, page)).send())
+        .map(|page| client.get(search_url(&query, page)).send())
         .collect();
 
     while let Some(res) = paged_res.join_next().await {
@@ -57,7 +60,7 @@ fn count_by_pr(prs: &[PRInfo]) -> HashMap<&str, usize> {
 fn make_client() -> Result<Client> {
     let mut headers = HeaderMap::new();
     if let Ok(token) = env::var("GITHUB_TOKEN") {
-        println!("Using token from GITHUB_TOKEN");
+        log::info!("Using token from GITHUB_TOKEN");
         let value = HeaderValue::from_str(&format!("Bearer {}", token))?;
         headers.insert("Authorization", value);
     }
@@ -65,14 +68,47 @@ fn make_client() -> Result<Client> {
     Ok(client)
 }
 
-type StatsMap = HashMap<String, (usize, usize, f32)>;
+struct PRStats {
+    approved: usize,
+    not_approved: usize,
+}
 
-async fn pr_stats() -> Result<StatsMap> {
+impl PRStats {
+    fn new() -> Self {
+        PRStats { approved: 0, not_approved: 0 }
+    }
+
+    fn new_with(approved: usize, not_approved: usize) -> Self {
+        PRStats { approved, not_approved }
+    }
+
+    fn update_from(&mut self, other: &PRStats) {
+        self.approved += other.approved;
+        self.not_approved += other.not_approved;
+    }
+}
+
+impl Display for PRStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "total: {}, approved: {}, not approved: {}, rate: {:.2}",
+            self.approved + self.not_approved,
+            self.approved,
+            self.not_approved,
+            self.approved as f32 / (self.approved + self.not_approved) as f32
+        )
+    }
+}
+
+type StatsMap = HashMap<String, PRStats>;
+
+async fn pr_stats(org: &str) -> Result<StatsMap> {
     let client = make_client()?;
     // Do both search queries in parallel
     let (res_approved, res_not) = try_join!(
-        prs_from_search(&client, "is:pr is:merged review:approved org:ssec-jhu"),
-        prs_from_search(&client, "is:pr is:merged -review:approved org:ssec-jhu"),
+        prs_from_search(&client, format!("is:pr is:merged review:approved org:{org}")),
+        prs_from_search(&client, format!("is:pr is:merged -review:approved org:{org}")),
     )?;
     let prs_approved = count_by_pr(&res_approved);
     let prs_not_approved = count_by_pr(&res_not);
@@ -82,31 +118,23 @@ async fn pr_stats() -> Result<StatsMap> {
     let mut combined = HashMap::new();
     for repo in prs_approved.keys().chain(prs_not_approved.keys()) {
         combined.entry(repo.to_string()).or_insert_with(|| {
-            let approved = prs_approved.get(repo).unwrap_or(&0);
-            let not_approved = prs_not_approved.get(repo).unwrap_or(&0);
-            let rate = *approved as f32 / (*approved as f32 + *not_approved as f32);
-            (*approved, *not_approved, rate)
+            PRStats::new_with(
+                *prs_approved.get(repo).unwrap_or(&0),
+                *prs_not_approved.get(repo).unwrap_or(&0))
         });
     }
     Ok(combined)
 }
 
-pub async fn report() -> Result<()> {
-    let combined = pr_stats().await?;
-    let mut tot_approved = 0;
-    let mut tot_not_approved = 0;
-    for (repo, (approved, not_approved, rate)) in combined.iter().sorted_by_key(|a| a.0) {
-        let total = approved + not_approved;
+pub async fn report(org: &str) -> Result<()> {
+    let combined = pr_stats(org).await?;
+    let mut tot_stats = PRStats::new();
+    for (repo, stats) in combined.iter().sorted_by_key(|a| a.0) {
         println!(
-            "{repo}: {total} total, {approved} approved, {not_approved} not approved, rate: {rate:.2}"
+            "{repo}: {stats}"
         );
-        tot_approved += approved;
-        tot_not_approved += not_approved;
+        tot_stats.update_from(stats);
     }
-    let tot_rate = tot_approved as f32 / (tot_approved as f32 + tot_not_approved as f32);
-    let tot_total = tot_approved + tot_not_approved;
-    println!(
-        "Total: {tot_total} total, {tot_approved} approved, {tot_not_approved} not approved, rate: {tot_rate:2}"
-    );
+    println!("Total: {tot_stats}");
     Ok(())
 }
