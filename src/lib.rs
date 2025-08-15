@@ -40,7 +40,9 @@ async fn prs_from_search(client: &Client, query: impl Into<String>) -> Result<Ve
 
     // issue all other page requests in parallel
     let num_pages = (resp.total_count as f32 / per_page as f32).ceil() as u32;
-    log::debug!("first page returned from query {query}, total count is: {}, num pages: {num_pages}", resp.total_count);
+    log::debug!(
+        "first page returned from query {query}, total count is: {}, num pages: {num_pages}",
+        resp.total_count);
 
     let mut paged_res: JoinSet<_> = (2..=num_pages)
         .map(|page| client.get(search_url(&query, page)).send())
@@ -115,7 +117,7 @@ async fn pr_stats(org: &str) -> Result<StatsMap> {
     // Combine the counts. Note that we don't necessarily know that the repos
     // will be fully in both sets, hence we chain the keys which may yield
     // repeats but covers all of them.
-    let mut combined = HashMap::new();
+    let mut combined = StatsMap::new();
     for repo in prs_approved.keys().chain(prs_not_approved.keys()) {
         combined.entry(repo.to_string()).or_insert_with(|| {
             PRStats::new_with(
